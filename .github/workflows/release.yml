@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 jobs:
-  # 发版前先校验：ci.yml 只过滤 branches，tag 推送不会触发它。
+  # 发版前先校验并**只构建一次**前端：ci.yml 只过滤 branches，tag 推送不会触发它。
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -24,7 +24,6 @@ jobs:
       - run: npm ci
       - run: npm run build
 
-      # 前端产物只构建一次：镜像阶段直接拷贝 dist/（多架构下不在 QEMU 里跑 node）。
       - uses: actions/upload-artifact@v7
         with:
           name: dist
@@ -32,31 +31,135 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  docker:
+  # 多架构镜像：与 wist-center / wist-ingest-ctrl 同构 —— 每个架构在**原生 runner**
+  # 上单独构建并 push-by-digest（amd64 → ubuntu-24.04，arm64 → ubuntu-24.04-arm），
+  # 最后由 docker-manifest 用 `imagetools create` 合成多架构 tag。
+  # 不要改回单个 job + `platforms: linux/amd64,linux/arm64`（QEMU + multi-arch push 会挂住）。
+  docker-amd64:
+    name: Docker image (linux/amd64)
     needs: [verify]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v7
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=web-amd64
+          cache-to: type=gha,mode=max,scope=web-amd64
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          [ -n "${digest}" ] || { echo "::error::build-push 没有返回 digest"; exit 1; }
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-amd64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-arm64:
+    name: Docker image (linux/arm64)
+    needs: [verify]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
 
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
 
-      - uses: docker/login-action@v3
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=web-arm64
+          cache-to: type=gha,mode=max,scope=web-arm64
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          [ -n "${digest}" ] || { echo "::error::build-push 没有返回 digest"; exit 1; }
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-arm64
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  docker-manifest:
+    name: Compose multi-arch manifest
+    needs: [docker-amd64, docker-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: /tmp/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Login to TCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: dy-sec.tencentcloudcr.com
           username: ${{ secrets.TCR_USERNAME }}
@@ -65,7 +168,7 @@ jobs:
       - name: Compute image tags
         id: meta
         run: |
-          # 预发布 tag（-alpha / -beta / -rc）只推该 tag，不覆盖 :latest。
+          # 预发布 tag（v0.1.0-alpha 等）只推该 tag，不覆盖 :latest。
           ghcr="ghcr.io/${{ github.repository }}"
           tcr="dy-sec.tencentcloudcr.com/cloud/wist-ingest-web"
           ref="${{ github.ref_name }}"
@@ -83,17 +186,27 @@ jobs:
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          platforms: linux/amd64,linux/arm64
+      - name: Create multi-arch manifests
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          digests=()
+          for f in /tmp/digests/*; do
+            digests+=("ghcr.io/${{ github.repository }}@sha256:$(basename "$f")")
+          done
+          [ "${#digests[@]}" -eq 2 ] || { echo "::error::期望 2 个架构 digest，实际 ${#digests[@]}"; exit 1; }
+          args=()
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && args+=(-t "$tag")
+          done <<< "$TAGS"
+          docker buildx imagetools create "${args[@]}" "${digests[@]}"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
+          done <<< "$TAGS"
 
   release:
-    needs: [docker]
+    needs: [docker-manifest]
     runs-on: ubuntu-latest
     permissions:
       contents: write
