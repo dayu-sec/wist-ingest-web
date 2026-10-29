@@ -10,47 +10,45 @@ permissions:
   contents: read
 
 jobs:
-  # 发版前先校验并**只构建一次**前端：ci.yml 只过滤 branches，tag 推送不会触发它。
+  # 1. 发版前先校验：构建必须通过才发镜像。
+  #
+  #    为什么要在这里再做一次：ci.yml 的 push 过滤是 `branches`，**tag 推送不会触发它**，
+  #    所以不加这一步，镜像可以在完全未经校验的情况下发布。
+  #    检查内容与 ci.yml 保持一致（本项目暂无测试脚本；将来加了测试也加在这里）。
   verify:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v7
+      - name: Install Node
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
 
-      - run: npm ci
-      - run: npm run build
+      - name: Install dependencies
+        run: npm ci
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: dist
-          path: dist
-          if-no-files-found: error
-          retention-days: 7
+      - name: Build
+        run: npm run build
 
-  # 多架构镜像：与 wist-center / wist-ingest-ctrl 同构 —— 每个架构在**原生 runner**
-  # 上单独构建并 push-by-digest（amd64 → ubuntu-24.04，arm64 → ubuntu-24.04-arm），
-  # 最后由 docker-manifest 用 `imagetools create` 合成多架构 tag。
-  # 不要改回单个 job + `platforms: linux/amd64,linux/arm64`（QEMU + multi-arch push 会挂住）。
-  docker-amd64:
-    name: Docker image (linux/amd64)
+  # 2. 构建多架构镜像并推送 ghcr.io。
+  docker:
     needs: [verify]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
 
-      - uses: docker/setup-buildx-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
         uses: docker/login-action@v4
@@ -59,105 +57,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=web-amd64
-          cache-to: type=gha,mode=max,scope=web-amd64
-
-      - name: Export digest
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          [ -n "${digest}" ] || { echo "::error::build-push 没有返回 digest"; exit 1; }
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: digest-amd64
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  docker-arm64:
-    name: Docker image (linux/arm64)
-    needs: [verify]
-    runs-on: ubuntu-24.04-arm
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push by digest
-        id: build
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/arm64
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
-          cache-from: type=gha,scope=web-arm64
-          cache-to: type=gha,mode=max,scope=web-arm64
-
-      - name: Export digest
-        run: |
-          set -euo pipefail
-          mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
-          [ -n "${digest}" ] || { echo "::error::build-push 没有返回 digest"; exit 1; }
-          touch "/tmp/digests/${digest#sha256:}"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: digest-arm64
-          path: /tmp/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
-  docker-manifest:
-    name: Compose multi-arch manifest
-    needs: [docker-amd64, docker-arm64]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/download-artifact@v8
-        with:
-          pattern: digest-*
-          path: /tmp/digests
-          merge-multiple: true
-
-      - uses: docker/setup-buildx-action@v4
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
+      # 国内镜像源（腾讯云 TCR）：国内服务器拉 ghcr.io 很慢，客户端改用 TCR 地址。
+      # 凭据在 TCR 控制台生成（访问凭证），存 GitHub Secrets：TCR_USERNAME / TCR_PASSWORD。
       - name: Login to TCR
         uses: docker/login-action@v4
         with:
@@ -168,52 +69,32 @@ jobs:
       - name: Compute image tags
         id: meta
         run: |
-          # 预发布 tag（v0.1.0-alpha 等）只推该 tag，不覆盖 :latest。
-          ghcr="ghcr.io/${{ github.repository }}"
+          # 预发布 tag（v0.1.3-alpha / -beta / -rc …）只推该 tag，**不覆盖 :latest**。
+          # 否则 :latest 会指向预发布产物，而 wist-ingest-stack 是按固定 tag 拉镜像的。
+          # 两个源（ghcr / TCR）同进退。
           tcr="dy-sec.tencentcloudcr.com/cloud/wist-ingest-web"
-          ref="${{ github.ref_name }}"
-          # 一行一个 tag。不要写成 `printf '%s\n%s' a b c`：参数多于格式里的占位符时，
-          # 第二轮从 `%s` 开始续写，会把最后两行粘成一个（`...:latest...:latest`）。
-          tags_file="${RUNNER_TEMP}/image-tags.txt"
-          printf '%s\n' "$ghcr:$ref" "$tcr:$ref" > "$tags_file"
-          case "$ref" in
-            *-*) ;;
-            *) printf '%s\n' "$ghcr:latest" "$tcr:latest" >> "$tags_file" ;;
+          tags="ghcr.io/${{ github.repository }}:${{ github.ref_name }}"
+          tags="$(printf '%s\n%s' "$tags" "$tcr:${{ github.ref_name }}")"
+          case "${{ github.ref_name }}" in
+            *-*)
+              ;;
+            *)
+              tags="$(printf '%s\n%s' "$tags" "ghcr.io/${{ github.repository }}:latest")"
+              tags="$(printf '%s\n%s' "$tags" "$tcr:latest")"
+              ;;
           esac
-          {
-            echo "tags<<__EOF__"
-            cat "$tags_file"
-            echo "__EOF__"
-          } >> "$GITHUB_OUTPUT"
+          printf 'tags<<__EOF__\n%s\n__EOF__\n' "$tags" >> "$GITHUB_OUTPUT"
 
-      - name: Create multi-arch manifests
-        env:
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          set -euo pipefail
-          digests=()
-          for f in /tmp/digests/*; do
-            digests+=("ghcr.io/${{ github.repository }}@sha256:$(basename "$f")")
-          done
-          [ "${#digests[@]}" -eq 2 ] || { echo "::error::期望 2 个架构 digest，实际 ${#digests[@]}"; exit 1; }
-          args=()
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && args+=(-t "$tag")
-          done <<< "$TAGS"
-          docker buildx imagetools create "${args[@]}" "${digests[@]}"
-          while IFS= read -r tag; do
-            [ -n "$tag" ] && docker buildx imagetools inspect "$tag"
-          done <<< "$TAGS"
-
-  release:
-    needs: [docker-manifest]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: softprops/action-gh-release@v3
+      - name: Build and push
+        uses: docker/build-push-action@v7
         with:
-          name: ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
-          generate_release_notes: true
+          context: .
+          push: true
+          build-args: |
+            APP_VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64,linux/arm64
+
+# 本文件与 `wist-center-web` 的 release.yml 同构（镜像地址用 `github.repository`，
+# 构建契约由仓库根 Dockerfile 满足：ARG APP_VERSION → ENV VITE_APP_VERSION）。
+# 本仓的交付物就是镜像，因此没有单独的 GitHub Release job（与 wist-center-web 一致）。
