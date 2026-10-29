@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.1.1] - 2026-10-29
+
+### 修复（发版链路，无功能变更）
+
+- `Dockerfile` / `release.yml` 与 `wist-center-web` 同构：node 构建阶段 → nginx 运行阶段，
+  单个 docker job 同推 ghcr 与腾讯云 TCR；预发布 tag 不覆盖 `:latest`。
+- 修正镜像 tag 拼接：`printf` 参数多于占位符时会把最后两个 tag 粘成一行，
+  docker 报 `invalid reference format`。
+
 ## [0.1.0] - 2026-10-29
 
 ### Added
