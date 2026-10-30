@@ -1,223 +1,208 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   ApiError,
   applyConfig,
   clearToken,
+  describeError,
   getCerts,
+  getLinks,
   getStatus,
   getWhoAmI,
   loadToken,
   saveToken,
   type CertFile,
+  type LinksView,
   type Status,
   type WhoAmI,
 } from './api'
+import { AccessPage } from './components/AccessPage'
+import { ConfigPage } from './components/ConfigPage'
+import { IdentityPage } from './components/IdentityPage'
+import { OverviewPage } from './components/OverviewPage'
+import { Shell, type Tab } from './components/Shell'
+import { Block, Card, Empty, ErrorBanner, Mono, PageShell } from './components/ui'
+
+const TABS: Tab[] = ['overview', 'access', 'config', 'identity']
+
+function readTab(): Tab {
+  const hash = window.location.hash.replace(/^#\/?/, '')
+  return (TABS as string[]).includes(hash) ? (hash as Tab) : 'overview'
+}
 
 export default function App() {
-  const [token, setToken] = useState(loadToken())
+  const [tab, setTab] = useState<Tab>(readTab)
+  const [token, setToken] = useState(loadToken)
   const [status, setStatus] = useState<Status | null>(null)
   const [certs, setCerts] = useState<CertFile[]>([])
   const [me, setMe] = useState<WhoAmI | null>(null)
+  const [links, setLinks] = useState<LinksView | null>(null)
+  const [linksError, setLinksError] = useState('')
   const [error, setError] = useState('')
+  const [invalidToken, setInvalidToken] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [syncing, setSyncing] = useState(false)
+  const [lastSyncedAt, setLastSyncedAt] = useState<number | null>(null)
 
-  function describe(e: unknown): string {
-    if (e instanceof ApiError) {
-      if (e.status === 401) return 'token 无效或缺失（401）'
-      if (e.status === 403) return '当前 token 没有该权限（403 insufficient_scope）'
-      if (e.status === 429) return `鉴权失败次数过多，请 ${e.retryAfter ?? 60}s 后重试（429）`
-      return `${e.code}: ${e.message}`
-    }
-    return (e as Error).message
-  }
+  // hash 路由：刷新 / 分享 / 浏览器后退都能回到同一页（不引入 router 依赖）。
+  useEffect(() => {
+    const onHash = () => setTab(readTab())
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
 
-  async function refresh() {
-    setBusy(true)
-    setError('')
+  const go = useCallback((next: Tab) => {
+    window.location.hash = next
+    setTab(next)
+  }, [])
+
+  const refresh = useCallback(async () => {
+    if (!token) return
+    setSyncing(true)
     try {
-      const [s, c, w] = await Promise.all([getStatus(), getCerts(), getWhoAmI()])
-      setStatus(s)
-      setCerts(c)
-      setMe(w)
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) clearToken()
-      setError(describe(e))
-    } finally {
-      setBusy(false)
-    }
-  }
+      const [nextStatus, nextCerts, nextMe] = await Promise.all([getStatus(), getCerts(), getWhoAmI()])
+      setStatus(nextStatus)
+      setCerts(nextCerts)
+      setMe(nextMe)
+      setError('')
+      setInvalidToken(false)
+      setLastSyncedAt(Date.now())
 
-  async function onApply() {
+      // 授权台账是后加的接口：单独失败不应把整页拖垮（「网关接入」页会给出解释）。
+      try {
+        setLinks(await getLinks())
+        setLinksError('')
+      } catch (cause) {
+        setLinks(null)
+        setLinksError(describeError(cause))
+      }
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        clearToken()
+        setToken('')
+        setInvalidToken(true)
+        setStatus(null)
+        setCerts([])
+        setMe(null)
+        setLinks(null)
+      }
+      setError(describeError(cause))
+    } finally {
+      setSyncing(false)
+    }
+  }, [token])
+
+  useEffect(() => {
+    if (!token) return
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 5_000)
+    return () => window.clearInterval(timer)
+  }, [token, refresh])
+
+  async function handleApply() {
     setBusy(true)
     setError('')
     try {
       await applyConfig(true)
       await refresh()
-    } catch (e) {
-      if (e instanceof ApiError && e.status === 401) clearToken()
-      setError(describe(e))
+    } catch (cause) {
+      setError(describeError(cause))
+    } finally {
       setBusy(false)
     }
   }
 
-  useEffect(() => {
-    if (token) void refresh()
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  function handleApplyToken(next: string) {
+    saveToken(next)
+    setToken(next)
+    setInvalidToken(false)
+    setError('')
+  }
 
-  const canApply = me?.can_apply === true
+  function handleClearToken() {
+    clearToken()
+    setToken('')
+    setStatus(null)
+    setCerts([])
+    setMe(null)
+    setLinks(null)
+    setInvalidToken(false)
+    setError('')
+    setLastSyncedAt(null)
+  }
+
+  const content = useMemo(() => {
+    if (!token) {
+      return (
+        <PageShell
+          title="需要管理令牌"
+          summary="填写 wist-ingest-ctrl 的 admin 或 viewer token（右上角「设置令牌」）后，本页才开始拉取数据。"
+        >
+          <Block>
+            <Card title="管理面鉴权">
+              <p className="muted">
+                令牌只存本会话标签页；<Mono>admin</Mono> 可下发配置 / 重启数据面 / 签发授权，
+                <Mono>viewer</Mono> 只读。
+              </p>
+              <Empty
+                title="还没有设置令牌"
+                hint={
+                  <>
+                    点右上角「设置令牌」粘贴。部署栈里真值在 <Mono>.wist/sec-value.yml</Mono>：
+                    <Mono> ingest_ctrl_admin_token </Mono>（<Mono>gops sec get ingest_ctrl_admin_token</Mono>）。
+                  </>
+                }
+              />
+            </Card>
+          </Block>
+        </PageShell>
+      )
+    }
+
+    if (!status) {
+      return (
+        <PageShell title="正在连接 ctrl" summary="拉取状态、身份文件与授权台账…">
+          <Block>{error ? <ErrorBanner>{error}</ErrorBanner> : <p className="muted">加载中…</p>}</Block>
+        </PageShell>
+      )
+    }
+
+    switch (tab) {
+      case 'access':
+        return <AccessPage links={links} linksError={linksError} me={me} certs={certs} onRefresh={refresh} />
+      case 'config':
+        return <ConfigPage token={token} />
+      case 'identity':
+        return <IdentityPage status={status} certs={certs} me={me} />
+      default:
+        return (
+          <OverviewPage
+            status={status}
+            certs={certs}
+            me={me}
+            links={links}
+            busy={busy}
+            error={error}
+            onApply={() => void handleApply()}
+            onRefresh={() => void refresh()}
+            onTab={go}
+          />
+        )
+    }
+  }, [token, status, tab, links, linksError, me, certs, busy, error, refresh, go])
 
   return (
-    <main>
-      <h1>wist-ingest</h1>
-      <p className="muted">数据面：warp-parse（TCP + mTLS）；控制面：wist-ingest-ctrl</p>
-
-      <section className="card">
-        <label htmlFor="token">管理面 token</label>
-        <div className="row">
-          <input
-            id="token"
-            type="password"
-            value={token}
-            placeholder="admin 或 viewer token"
-            onChange={(e) => setToken(e.target.value)}
-          />
-          <button
-            onClick={() => {
-              saveToken(token)
-              void refresh()
-            }}
-            disabled={busy || !token}
-          >
-            加载
-          </button>
-        </div>
-        {me && (
-          <p className="muted">
-            作用域 <strong className={canApply ? 'ok' : ''}>{me.scope}</strong>
-            {me.identity && (
-              <>
-                {' '}· 传输身份 <span className="mono">{me.identity.id}</span>
-                {' '}· 指纹 <span className="mono">{me.identity.fingerprint_sha256.slice(0, 16)}…</span>
-              </>
-            )}
-          </p>
-        )}
-      </section>
-
-      {error && <pre className="error">{error}</pre>}
-
-      {me && !canApply && (
-        <p className="hint">
-          当前是只读 token：可以查看状态与证书，但不能下发配置或重启数据面。
-        </p>
-      )}
-
-      {status && (
-        <section className="card">
-          <h2>状态</h2>
-          <dl className="kv">
-            <dt>容器</dt>
-            <dd>{status.container}</dd>
-            <dt>监听</dt>
-            <dd>
-              {status.listen}:{status.port}（framing={status.framing}）
-            </dd>
-            <dt>工作根</dt>
-            <dd>{status.work_root}</dd>
-            <dt>管理面 TLS</dt>
-            <dd>
-              {status.tls
-                ? `${status.tls.cert_file}${status.tls.mtls ? ' · mTLS' : ' · 单向'}`
-                : '未启用'}
-            </dd>
-            <dt>上次生效</dt>
-            <dd>
-              {status.state
-                ? `${status.state.applied_at} · revision ${status.state.revision.slice(0, 12)} · restart=${status.state.restarted}`
-                : '（未生效过）'}
-            </dd>
-          </dl>
-
-          {status.lint.length > 0 && (
-            <ul className="findings">
-              {status.lint.map((f) => (
-                <li key={f.code} className={f.level}>
-                  [{f.level}] {f.code} {f.message}
-                </li>
-              ))}
-            </ul>
-          )}
-
-          <div className="row">
-            <button onClick={() => void refresh()} disabled={busy}>
-              刷新
-            </button>
-            <button
-              onClick={() => void onApply()}
-              disabled={busy || !canApply}
-              title={canApply ? '' : '需要 admin token'}
-            >
-              应用配置并重启
-            </button>
-          </div>
-        </section>
-      )}
-
-      {certs.length > 0 && (
-        <section className="card">
-          <h2>身份文件</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>角色</th>
-                <th>状态</th>
-                <th>mode</th>
-                <th>SHA-256</th>
-                <th>notAfter</th>
-              </tr>
-            </thead>
-            <tbody>
-              {certs.map((c) => (
-                <tr key={c.role}>
-                  <td>{c.role}</td>
-                  <td className={c.exists && !c.error ? 'ok' : 'bad'}>
-                    {c.exists && !c.error ? 'present' : (c.error ?? 'missing')}
-                  </td>
-                  <td>{c.mode ?? '-'}</td>
-                  <td className="mono">{c.sha256 ? c.sha256.slice(0, 24) + '…' : '—'}</td>
-                  <td>{c.not_after ?? '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </section>
-      )}
-
-      {status && status.gateways.length > 0 && (
-        <section className="card">
-          <h2>网关台账</h2>
-          <table>
-            <thead>
-              <tr>
-                <th>网关</th>
-                <th>租户</th>
-              </tr>
-            </thead>
-            <tbody>
-              {status.gateways.map((g) => (
-                <tr key={g.name}>
-                  <td>{g.name}</td>
-                  <td>{g.tenant ?? '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          <p className="muted">
-            证书身份尚未透出（上游 tcp source 不写 peer cert 到 tags），此处仅作台账，不能作为授权依据。
-          </p>
-        </section>
-      )}
-    </main>
+    <Shell
+      tab={tab}
+      onTab={go}
+      token={token}
+      invalidToken={invalidToken}
+      onApplyToken={handleApplyToken}
+      onClearToken={handleClearToken}
+      syncing={syncing}
+      lastSyncedAt={lastSyncedAt}
+      onRefresh={() => void refresh()}
+    >
+      {content}
+    </Shell>
   )
 }
